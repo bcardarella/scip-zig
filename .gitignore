@@ -1,6 +1,8 @@
 /zig-cache
+/.zig-cache
 /zig-out
 /scip-snapshot
 *.scip
 *.lsif
 /tok
+.claude/

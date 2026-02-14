@@ -59,11 +59,11 @@ pub const Metadata = struct {
     text_document_encoding: TextEncoding,
 };
 
-pub const ProtocolVersion = enum(u64) {
+pub const ProtocolVersion = enum(i32) {
     unspecified_protocol_version = 0,
 };
 
-pub const TextEncoding = enum(u64) {
+pub const TextEncoding = enum(i32) {
     unspecified_text_encoding = 0,
     utf8 = 1,
     utf16 = 2,
@@ -84,6 +84,13 @@ pub const ToolInfo = struct {
     arguments: std.ArrayListUnmanaged([]const u8),
 };
 
+pub const PositionEncoding = enum(i32) {
+    unspecified_position_encoding = 0,
+    utf8_code_unit_offset_from_line_start = 1,
+    utf16_code_unit_offset_from_line_start = 2,
+    utf32_code_unit_offset_from_line_start = 3,
+};
+
 /// Document defines the metadata about a source file on disk.
 pub const Document = struct {
     pub const tags = .{
@@ -91,6 +98,8 @@ pub const Document = struct {
         .{ "relative_path", 1 },
         .{ "occurrences", 2 },
         .{ "symbols", 3 },
+        .{ "text", 5 },
+        .{ "position_encoding", 6 },
     };
 
     /// The string ID for the programming language this file is written in.
@@ -112,6 +121,10 @@ pub const Document = struct {
     occurrences: std.ArrayListUnmanaged(Occurrence),
     /// Symbols that are defined within this document.
     symbols: std.ArrayListUnmanaged(SymbolInformation),
+    /// (optional) The text of the document when used as signature documentation.
+    text: []const u8 = "",
+    /// (optional) Position encoding used for ranges in this document.
+    position_encoding: PositionEncoding = .unspecified_position_encoding,
 };
 
 /// Symbol is similar to a URI, it identifies a class, method, or a local
@@ -178,7 +191,7 @@ pub const Package = struct {
 };
 
 pub const Descriptor = struct {
-    pub const Suffix = enum(u64) {
+    pub const Suffix = enum(i32) {
         unspecified_suffix = 0,
         /// Unit of code abstraction and/or namespacing.
         ///
@@ -213,6 +226,10 @@ pub const SymbolInformation = struct {
         .{ "symbol", 1 },
         .{ "documentation", 3 },
         .{ "relationships", 4 },
+        .{ "kind", 5 },
+        .{ "display_name", 6 },
+        .{ "signature_documentation", 7 },
+        .{ "enclosing_symbol", 8 },
     };
 
     /// Identifier of this symbol, which can be referenced from `Occurence.symbol`.
@@ -225,6 +242,127 @@ pub const SymbolInformation = struct {
     documentation: std.ArrayListUnmanaged([]const u8),
     /// (optional) Relationships to other symbols (e.g., implements, type definition).
     relationships: std.ArrayListUnmanaged(Relationship),
+    /// (optional) The kind of this symbol (e.g., function, type, variable).
+    kind: SymbolKind = .unspecified_kind,
+    /// (optional) Human-readable display name of this symbol.
+    display_name: []const u8 = "",
+    /// (optional) The signature of this symbol as displayed in API documentation
+    /// or hover tooltips.
+    signature_documentation: ?SignatureDocumentation = null,
+    /// (optional) The enclosing symbol, if any.
+    enclosing_symbol: []const u8 = "",
+
+    pub const SymbolKind = enum(i32) {
+        unspecified_kind = 0,
+        array = 1,
+        assertion = 2,
+        associated_type = 3,
+        attribute = 4,
+        axiom = 5,
+        boolean = 6,
+        class = 7,
+        constant = 8,
+        constructor = 9,
+        data_family = 10,
+        @"enum" = 11,
+        enum_member = 12,
+        event = 13,
+        fact = 14,
+        field = 15,
+        file = 16,
+        function = 17,
+        getter = 18,
+        grammar = 19,
+        instance = 20,
+        interface = 21,
+        key = 22,
+        lang = 23,
+        lemma = 24,
+        macro = 25,
+        method = 26,
+        method_receiver = 27,
+        message = 28,
+        module = 29,
+        namespace = 30,
+        null = 31,
+        number = 32,
+        object = 33,
+        operator = 34,
+        package = 35,
+        package_object = 36,
+        parameter = 37,
+        parameter_label = 38,
+        pattern = 39,
+        predicate = 40,
+        property = 41,
+        protocol = 42,
+        quasiquoter = 43,
+        self_parameter = 44,
+        setter = 45,
+        signature = 46,
+        subscript = 47,
+        string = 48,
+        @"struct" = 49,
+        tactic = 50,
+        theorem = 51,
+        this_parameter = 52,
+        trait = 53,
+        type = 54,
+        type_alias = 55,
+        type_class = 56,
+        type_family = 57,
+        type_parameter = 58,
+        @"union" = 59,
+        value = 60,
+        variable = 61,
+        contract = 62,
+        @"error" = 63,
+        library = 64,
+        modifier = 65,
+        abstract_method = 66,
+        method_specification = 67,
+        protocol_method = 68,
+        pure_virtual_method = 69,
+        trait_method = 70,
+        type_class_method = 71,
+        accessor = 72,
+        delegate = 73,
+        method_alias = 74,
+        singleton_class = 75,
+        singleton_method = 76,
+        static_data_member = 77,
+        static_event = 78,
+        static_field = 79,
+        static_method = 80,
+        static_property = 81,
+        static_variable = 82,
+        extension = 84,
+        mixin = 85,
+        concept = 86,
+    };
+};
+
+/// SignatureDocumentation mirrors the Document message for the
+/// SymbolInformation.signature_documentation field. The `symbols` field
+/// (tag 3) is intentionally omitted to break the type cycle:
+/// Document -> SymbolInformation -> SignatureDocumentation -> SymbolInformation.
+/// Unknown fields (including `symbols`) are silently skipped during decoding.
+pub const SignatureDocumentation = struct {
+    pub const tags = .{
+        .{ "relative_path", 1 },
+        .{ "occurrences", 2 },
+        .{ "language", 4 },
+        .{ "text", 5 },
+        .{ "position_encoding", 6 },
+    };
+
+    relative_path: []const u8 = "",
+    occurrences: std.ArrayListUnmanaged(Occurrence) = .{},
+    /// The language of the signature (e.g., "zig").
+    language: []const u8 = "",
+    /// The signature text (e.g., "fn add(a: i32, b: i32) i32").
+    text: []const u8 = "",
+    position_encoding: PositionEncoding = .unspecified_position_encoding,
 };
 
 pub const Relationship = struct {
@@ -233,6 +371,7 @@ pub const Relationship = struct {
         .{ "is_reference", 2 },
         .{ "is_implementation", 3 },
         .{ "is_type_definition", 4 },
+        .{ "is_definition", 5 },
     };
 
     symbol: []const u8,
@@ -272,6 +411,9 @@ pub const Relationship = struct {
     is_implementation: bool,
     /// Similar to `references_symbols` but for "Go to type definition".
     is_type_definition: bool,
+    /// When set to true, this relationship documents that the enclosing symbol
+    /// is a definition of the referenced symbol.
+    is_definition: bool = false,
 };
 
 /// SymbolRole declares what "role" a symbol has in an occurrence.  A role is
@@ -279,7 +421,7 @@ pub const Relationship = struct {
 /// to determine if the `Import` role is set, test whether the second bit of the
 /// enum value is defined. In pseudocode, this can be implemented with the
 /// logic: `const isImportRole = (role.value & SymbolRole.Import.value) > 0`.
-pub const SymbolRole = enum(u64) {
+pub const SymbolRole = enum(i32) {
     /// This case is not meant to be used; it only exists to avoid an error
     /// from the Protobuf code generator.
     unspecified_symbol_role = 0,
@@ -295,9 +437,11 @@ pub const SymbolRole = enum(u64) {
     generated = 0x10,
     /// Is the symbol in test code?
     @"test" = 0x20,
+    /// Is the symbol a forward definition?
+    forward_definition = 0x40,
 };
 
-pub const SyntaxKind = enum(u64) {
+pub const SyntaxKind = enum(i32) {
     unspecified_syntax_kind = 0,
 
     /// Comment, including comment markers and text
@@ -401,6 +545,7 @@ pub const Occurrence = struct {
         .{ "override_documentation", 4 },
         .{ "syntax_kind", 5 },
         .{ "diagnostics", 6 },
+        .{ "enclosing_range", 7 },
     };
 
     /// Source position of this occurrence. Must be exactly three or four
@@ -421,13 +566,13 @@ pub const Occurrence = struct {
     /// instead.  The `repeated int32` encoding is admittedly more embarrassing to
     /// work with in some programming languages but we hope the performance
     /// improvements make up for it.
-    range: [4]i32,
+    range: std.ArrayListUnmanaged(i32) = .{},
     /// (optional) The symbol that appears at this position. See
     /// `SymbolInformation.symbol` for how to format symbols as strings.
     symbol: []const u8,
     /// (optional) Bitset containing `SymbolRole`s in this occurrence.
     /// See `SymbolRole`'s documentation for how to read and write this field.
-    symbol_roles: u32,
+    symbol_roles: i32,
     /// (optional) CommonMark-formatted documentation for this specific range. If
     /// empty, the `Symbol.documentation` field is used instead. One example
     /// where this field might be useful is when the symbol represents a generic
@@ -441,6 +586,8 @@ pub const Occurrence = struct {
     syntax_kind: SyntaxKind,
     /// (optional) Diagnostics that have been reported for this specific range.
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
+    /// (optional) Enclosing range of the symbol occurrence.
+    enclosing_range: std.ArrayListUnmanaged(i32) = .{},
 };
 
 /// Represents a diagnostic, such as a compiler error or warning, which should be
@@ -451,7 +598,7 @@ pub const Diagnostic = struct {
         .{ "code", 2 },
         .{ "message", 3 },
         .{ "source", 4 },
-        .{ "tags", 5 },
+        .{ "diagnostic_tags", 5 },
     };
 
     /// Should this diagnostic be reported as an error, warning, info, or hint?
@@ -463,10 +610,12 @@ pub const Diagnostic = struct {
     /// (optional) Human-readable string describing the source of this diagnostic, e.g.
     /// 'typescript' or 'super lint'.
     source: []const u8,
-    tags: std.ArrayListUnmanaged(DiagnosticTag),
+    /// Proto field name is `tags` (field 5); named `diagnostic_tags` in Zig
+    /// to avoid collision with the `pub const tags` metadata required by protobruh.
+    diagnostic_tags: std.ArrayListUnmanaged(DiagnosticTag),
 };
 
-pub const Severity = enum(u64) {
+pub const Severity = enum(i32) {
     unspecified_severity = 0,
     @"error" = 1,
     warning = 2,
@@ -474,7 +623,7 @@ pub const Severity = enum(u64) {
     hint = 4,
 };
 
-pub const DiagnosticTag = enum(u64) {
+pub const DiagnosticTag = enum(i32) {
     unspecified_diagnostic_tag = 0,
     unnecessary = 1,
     deprecated = 2,
@@ -486,7 +635,7 @@ pub const DiagnosticTag = enum(u64) {
 /// multiple string representations. For example, the C++ language uses the name
 /// "CPlusPlus" in this enum and other names such as "cpp" are incompatible.
 /// Feel free to send a pull-request to add missing programming languages.
-pub const Language = enum(u64) {
+pub const Language = enum(i32) {
     unspecified_language = 0,
     abap = 60,
     apl = 49,
@@ -581,11 +730,21 @@ pub const Language = enum(u64) {
     xsl = 32,
     yaml = 74,
     zig = 38,
-    // NextLanguage = 95;
-    // Steps add a new language:
-    // 1. Copy-paste the "NextLanguage = N" line above
-    // 2. Increment "NextLanguage = N" to "NextLanguage = N+1"
-    // 3. Replace "NextLanguage = N" with the name of the new language.
-    // 4. Move the new language to the correct line above using alphabetical order
-    // 5. (optional) Add a brief comment behind the language if the name is not self-explanatory
+    solidity = 95,
+    apex = 96,
+    cuda = 97,
+    graph_ql = 98,
+    pascal = 99,
+    protobuf = 100,
+    tcl = 101,
+    repro = 102,
+    thrift = 103,
+    verilog = 104,
+    vhdl = 105,
+    svelte = 106,
+    slang = 107,
+    luau = 108,
+    justfile = 109,
+    nickel = 110,
+    // NextLanguage = 111;
 };

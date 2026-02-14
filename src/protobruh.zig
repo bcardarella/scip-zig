@@ -13,23 +13,23 @@ pub const WireType = enum(usize) {
 
 pub const SplitTag = struct { field: usize, wire_type: WireType };
 fn splitTag(tag: usize) SplitTag {
-    return .{ .field = tag >> 3, .wire_type = @intToEnum(WireType, tag & 7) };
+    return .{ .field = tag >> 3, .wire_type = @enumFromInt(tag & 7) };
 }
 
 fn joinTag(split: SplitTag) usize {
-    return (split.field << 3) | @enumToInt(split.wire_type);
+    return (split.field << 3) | @intFromEnum(split.wire_type);
 }
 
 fn readTag(reader: anytype) !SplitTag {
-    return splitTag(try std.leb.readULEB128(usize, reader));
+    return splitTag(try std.leb.readUleb128(usize, reader));
 }
 
 fn writeTag(writer: anytype, split: SplitTag) !void {
-    try std.leb.writeULEB128(writer, joinTag(split));
+    try std.leb.writeUleb128(writer, joinTag(split));
 }
 
 fn isArrayList(comptime T: type) bool {
-    return @typeInfo(T) == .Struct and @hasField(T, "items") and @hasField(T, "capacity");
+    return @typeInfo(T) == .@"struct" and @hasField(T, "items") and @hasField(T, "capacity");
 }
 
 // DECODE
@@ -41,27 +41,84 @@ pub fn decode(comptime T: type, allocator: std.mem.Allocator, reader: anytype) !
 }
 
 fn decodeMessageFields(comptime T: type, allocator: std.mem.Allocator, reader: anytype, length: usize) !T {
-    var counting_reader = std.io.countingReader(reader);
+    var bytes_read: usize = 0;
     var value = if (@hasField(T, "items") and @hasField(T, "capacity")) .{} else std.mem.zeroInit(T, .{});
 
-    while (length == 0 or counting_reader.bytes_read < length) {
-        // TODO: Add type sameness checks
-        const split = readTag(counting_reader.reader()) catch |err| switch (err) {
+    while (length == 0 or bytes_read < length) {
+        var tag_counter = ByteCounter(@TypeOf(reader)){ .inner = reader, .count = &bytes_read };
+        const split = readTag(&tag_counter) catch |err| switch (err) {
             error.EndOfStream => return value,
             else => return err,
         };
 
+        var matched = false;
         inline for (@field(T, "tags")) |rel| {
             if (split.field == rel[1]) {
-                decodeInternal(@TypeOf(@field(value, rel[0])), &@field(value, rel[0]), allocator, counting_reader.reader(), false) catch |err| switch (err) {
-                    error.EndOfStream => return value,
-                    else => return err,
-                };
+                const expected_wt = typeToWireType(@TypeOf(@field(value, rel[0])));
+                if (split.wire_type == expected_wt) {
+                    var field_counter = ByteCounter(@TypeOf(reader)){ .inner = reader, .count = &bytes_read };
+                    decodeInternal(@TypeOf(@field(value, rel[0])), &@field(value, rel[0]), allocator, &field_counter, false) catch |err| switch (err) {
+                        error.EndOfStream => return value,
+                        else => return err,
+                    };
+                    matched = true;
+                }
+            }
+        }
+
+        if (!matched) {
+            // Skip unknown or wire-type-mismatched field
+            var counter = ByteCounter(@TypeOf(reader)){ .inner = reader, .count = &bytes_read };
+            switch (split.wire_type) {
+                .varint_or_zigzag => {
+                    _ = std.leb.readUleb128(u64, &counter) catch return value;
+                },
+                .delimited => {
+                    const skip_len = std.leb.readUleb128(usize, &counter) catch return value;
+                    var remaining = skip_len;
+                    while (remaining > 0) {
+                        _ = counter.readByte() catch return value;
+                        remaining -= 1;
+                    }
+                },
+                .fixed64bit => {
+                    var i: usize = 0;
+                    while (i < 8) : (i += 1) {
+                        _ = counter.readByte() catch return value;
+                    }
+                },
+                .fixed32bit => {
+                    var i: usize = 0;
+                    while (i < 4) : (i += 1) {
+                        _ = counter.readByte() catch return value;
+                    }
+                },
+                else => return value,
             }
         }
     }
 
     return value;
+}
+
+/// A simple wrapper that counts bytes read via readByte
+fn ByteCounter(comptime ReaderType: type) type {
+    return struct {
+        inner: ReaderType,
+        count: *usize,
+
+        pub fn readByte(self: *@This()) !u8 {
+            const b = try self.inner.readByte();
+            self.count.* += 1;
+            return b;
+        }
+
+        pub fn readAll(self: *@This(), buf: []u8) !usize {
+            const n = try self.inner.readAll(buf);
+            self.count.* += n;
+            return n;
+        }
+    };
 }
 
 fn decodeInternal(
@@ -72,51 +129,73 @@ fn decodeInternal(
     top: bool,
 ) !void {
     switch (@typeInfo(T)) {
-        .Struct => {
+        .@"struct" => {
             if (comptime isArrayList(T)) {
-                const Child = @typeInfo(@field(T, "Slice")).Pointer.child;
+                const Child = @typeInfo(@field(T, "Slice")).pointer.child;
                 const cti = @typeInfo(Child);
 
-                if (cti == .Int or cti == .Enum) {
-                    var lim = std.io.limitedReader(reader, try std.leb.readULEB128(usize, reader));
-                    while (true)
-                        try value.append(allocator, decode(Child, allocator, lim.reader()) catch return);
+                if (cti == .int or cti == .@"enum") {
+                    const limit = try std.leb.readUleb128(usize, reader);
+                    var bytes_consumed: usize = 0;
+                    while (bytes_consumed < limit) {
+                        var counter = ByteCounter(@TypeOf(reader)){ .inner = reader, .count = &bytes_consumed };
+                        try value.append(allocator, decode(Child, allocator, &counter) catch return);
+                    }
                 } else {
                     var new_elem: Child = undefined;
                     try decodeInternal(Child, &new_elem, allocator, reader, false);
                     try value.append(allocator, new_elem);
                 }
             } else {
-                var length = if (top) 0 else try std.leb.readULEB128(usize, reader);
+                const length = if (top) 0 else try std.leb.readUleb128(usize, reader);
                 value.* = try decodeMessageFields(T, allocator, reader, length);
             }
         },
-        .Pointer => |ptr| {
-            _ = ptr;
-            // TODO: Handle non-slices
-            if (T == []const u8) {
-                var data = try allocator.alloc(u8, try std.leb.readULEB128(usize, reader));
-                _ = try reader.readAll(data);
-                value.* = data;
-            } else @compileError("Slices not implemented");
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                const len = try std.leb.readUleb128(usize, reader);
+                if (ptr.child == u8) {
+                    const data = try allocator.alloc(u8, len);
+                    _ = try reader.readAll(data);
+                    value.* = data;
+                } else if (@typeInfo(ptr.child) == .@"struct") {
+                    @compileError("Use ArrayList for repeated message fields, not slices of: " ++ @typeName(T));
+                } else {
+                    @compileError("Slice decode not implemented for: " ++ @typeName(T));
+                }
+            } else if (ptr.size == .one) {
+                // Single-item pointer: allocate and decode inner type
+                const inner = try allocator.create(ptr.child);
+                try decodeInternal(ptr.child, inner, allocator, reader, false);
+                value.* = inner;
+            } else {
+                @compileError("Pointer decode not implemented for: " ++ @typeName(T));
+            }
         },
-        // TODO: non-usize enums
-        .Enum => value.* = @intToEnum(T, try std.leb.readULEB128(usize, reader)),
-        .Int => |i| value.* = switch (i.signedness) {
-            .signed => try std.leb.readILEB128(T, reader),
-            .unsigned => try std.leb.readULEB128(T, reader),
+        .@"enum" => |e| {
+            const tag_info = @typeInfo(e.tag_type).int;
+            const UnsignedTag = @Type(.{ .int = .{ .signedness = .unsigned, .bits = tag_info.bits } });
+            const raw = try std.leb.readUleb128(UnsignedTag, reader);
+            value.* = @enumFromInt(@as(e.tag_type, @bitCast(raw)));
         },
-        .Bool => value.* = ((try std.leb.readULEB128(usize, reader)) != 0),
-        .Array => |arr| {
+        .int => |i| value.* = switch (i.signedness) {
+            // Protobuf int32/int64: read unsigned varint, bitcast to i64, truncate to target type
+            .signed => @intCast(@as(i64, @bitCast(try std.leb.readUleb128(u64, reader)))),
+            .unsigned => try std.leb.readUleb128(T, reader),
+        },
+        .bool => value.* = ((try std.leb.readUleb128(usize, reader)) != 0),
+        .array => |arr| {
             const Child = arr.child;
             const cti = @typeInfo(Child);
 
-            if (cti == .Int or cti == .Enum) {
-                var lim = std.io.limitedReader(reader, try std.leb.readULEB128(usize, reader));
+            if (cti == .int or cti == .@"enum") {
+                const limit = try std.leb.readUleb128(usize, reader);
                 var array: [arr.len]Child = undefined;
                 var index: usize = 0;
-                while (true) : (index += 1) {
-                    const new_item = decode(Child, allocator, lim.reader()) catch break;
+                var bytes_consumed: usize = 0;
+                while (bytes_consumed < limit) : (index += 1) {
+                    var counter = ByteCounter(@TypeOf(reader)){ .inner = reader, .count = &bytes_consumed };
+                    const new_item = decode(Child, allocator, &counter) catch break;
                     if (index == array.len) return error.IndexOutOfRange;
                     array[index] = new_item;
                 }
@@ -138,8 +217,9 @@ pub fn encode(value: anytype, writer: anytype) !void {
 }
 
 fn typeToWireType(comptime T: type) WireType {
-    if (@typeInfo(T) == .Struct or @typeInfo(T) == .Pointer or @typeInfo(T) == .Array) return .delimited;
-    if (@typeInfo(T) == .Int or @typeInfo(T) == .Bool or @typeInfo(T) == .Enum) return .varint_or_zigzag;
+    if (@typeInfo(T) == .optional) return typeToWireType(@typeInfo(T).optional.child);
+    if (@typeInfo(T) == .@"struct" or @typeInfo(T) == .pointer or @typeInfo(T) == .array) return .delimited;
+    if (@typeInfo(T) == .int or @typeInfo(T) == .bool or @typeInfo(T) == .@"enum") return .varint_or_zigzag;
     @compileError("Wire type not handled: " ++ @typeName(T));
 }
 
@@ -149,18 +229,45 @@ fn encodeMessageFields(value: anytype, writer: anytype) !void {
         const subval = @field(value, rel[0]);
         const SubT = @TypeOf(subval);
 
-        if (comptime isArrayList(SubT) and !b: {
-            const Child = @typeInfo(@field(SubT, "Slice")).Pointer.child;
+        if (comptime @typeInfo(SubT) == .optional) {
+            if (subval) |inner| {
+                // Inline encoding for optional message fields to avoid
+                // recursive error set resolution issues with encodeInternal
+                try writeTag(writer, .{ .field = rel[1], .wire_type = .delimited });
+                var discard_buf: [64]u8 = undefined;
+                var discarding = std.Io.Writer.Discarding.init(&discard_buf);
+                try encodeMessageFields(inner, &discarding.writer);
+                try std.leb.writeUleb128(writer, discarding.fullCount());
+                try encodeMessageFields(inner, writer);
+            }
+        } else if (comptime isArrayList(SubT) and !b: {
+            const Child = @typeInfo(@field(SubT, "Slice")).pointer.child;
             const cti = @typeInfo(Child);
-            break :b cti == .Int or cti == .Enum;
+            break :b cti == .int or cti == .@"enum";
         }) {
-            for (subval.items) |item| {
-                try writeTag(writer, .{ .field = rel[1], .wire_type = typeToWireType(@TypeOf(item)) });
-                try encodeInternal(item, writer, false);
+            if (subval.items.len > 0) {
+                for (subval.items) |item| {
+                    try writeTag(writer, .{ .field = rel[1], .wire_type = typeToWireType(@TypeOf(item)) });
+                    try encodeInternal(item, writer, false);
+                }
             }
         } else {
-            try writeTag(writer, .{ .field = rel[1], .wire_type = typeToWireType(SubT) });
-            try encodeInternal(subval, writer, false);
+            const skip = if (comptime isArrayList(SubT))
+                subval.items.len == 0
+            else if (comptime @typeInfo(SubT) == .int)
+                subval == 0
+            else if (comptime @typeInfo(SubT) == .bool)
+                !subval
+            else if (comptime @typeInfo(SubT) == .@"enum")
+                @intFromEnum(subval) == 0
+            else if (comptime @typeInfo(SubT) == .pointer and @typeInfo(SubT).pointer.size == .slice)
+                subval.len == 0
+            else
+                false;
+            if (!skip) {
+                try writeTag(writer, .{ .field = rel[1], .wire_type = typeToWireType(SubT) });
+                try encodeInternal(subval, writer, false);
+            }
         }
     }
 }
@@ -172,42 +279,249 @@ fn encodeInternal(
 ) !void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
-        .Struct => {
+        .@"struct" => {
             if (comptime isArrayList(T)) {
-                var count_writer = std.io.countingWriter(std.io.null_writer);
-                for (value.items) |item| try encodeInternal(item, count_writer.writer(), false);
-                try std.leb.writeULEB128(writer, count_writer.bytes_written);
+                var discard_buf: [64]u8 = undefined;
+                var discarding = std.Io.Writer.Discarding.init(&discard_buf);
+                for (value.items) |item| try encodeInternal(item, &discarding.writer, false);
+                try std.leb.writeUleb128(writer, discarding.fullCount());
                 for (value.items) |item| try encodeInternal(item, writer, false);
             } else {
                 if (!top) {
-                    var count_writer = std.io.countingWriter(std.io.null_writer);
-                    try encodeMessageFields(value, count_writer.writer());
-                    try std.leb.writeULEB128(writer, count_writer.bytes_written);
+                    var discard_buf: [64]u8 = undefined;
+                    var discarding = std.Io.Writer.Discarding.init(&discard_buf);
+                    try encodeMessageFields(value, &discarding.writer);
+                    try std.leb.writeUleb128(writer, discarding.fullCount());
                 }
                 try encodeMessageFields(value, writer);
             }
         },
-        .Pointer => |ptr| {
-            _ = ptr;
-            // TODO: Handle non-slices
-            if (T == []const u8) {
-                try std.leb.writeULEB128(writer, value.len);
-                try writer.writeAll(value);
-            } else @compileError("Slices not implemented");
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                if (ptr.child == u8) {
+                    try std.leb.writeUleb128(writer, value.len);
+                    try writer.writeAll(value);
+                } else if (@typeInfo(ptr.child) == .@"struct") {
+                    @compileError("Use ArrayList for repeated message fields, not slices of: " ++ @typeName(T));
+                } else {
+                    @compileError("Slice encode not implemented for: " ++ @typeName(T));
+                }
+            } else if (ptr.size == .one) {
+                try encodeInternal(value.*, writer, false);
+            } else {
+                @compileError("Pointer encode not implemented for: " ++ @typeName(T));
+            }
         },
-        // TODO: non-usize enums
-        .Enum => try std.leb.writeULEB128(writer, @enumToInt(value)),
-        .Int => |i| switch (i.signedness) {
-            .signed => try std.leb.writeILEB128(writer, value),
-            .unsigned => try std.leb.writeULEB128(writer, value),
+        .@"enum" => |e| {
+            const tag_info = @typeInfo(e.tag_type).int;
+            const UnsignedTag = @Type(.{ .int = .{ .signedness = .unsigned, .bits = tag_info.bits } });
+            try std.leb.writeUleb128(writer, @as(UnsignedTag, @bitCast(@as(e.tag_type, @intFromEnum(value)))));
         },
-        .Bool => try std.leb.writeULEB128(writer, @boolToInt(value)),
-        .Array => {
-            var count_writer = std.io.countingWriter(std.io.null_writer);
-            for (value) |item| try encodeInternal(item, count_writer.writer(), false);
-            try std.leb.writeULEB128(writer, count_writer.bytes_written);
+        .int => |i| switch (i.signedness) {
+            // Protobuf int32/int64: sign-extend to i64, bitcast to u64, encode as unsigned varint
+            .signed => try std.leb.writeUleb128(writer, @as(u64, @bitCast(@as(i64, value)))),
+            .unsigned => try std.leb.writeUleb128(writer, value),
+        },
+        .bool => try std.leb.writeUleb128(writer, @intFromBool(value)),
+        .array => {
+            var discard_buf: [64]u8 = undefined;
+            var discarding = std.Io.Writer.Discarding.init(&discard_buf);
+            for (value) |item| try encodeInternal(item, &discarding.writer, false);
+            try std.leb.writeUleb128(writer, discarding.fullCount());
             for (value) |item| try encodeInternal(item, writer, false);
         },
         else => @compileError("Unsupported: " ++ @typeName(T)),
     }
+}
+
+// --- Tests ---
+
+fn encodeToSlice(value: anytype, buf: []u8) ![]u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    try encode(value, fbs.writer());
+    return fbs.getWritten();
+}
+
+const TestEnum = enum(u8) {
+    foo = 0,
+    bar = 1,
+    baz = 2,
+};
+
+const SimpleMsg = struct {
+    pub const tags = .{
+        .{ "value", 1 },
+        .{ "name", 2 },
+        .{ "flag", 3 },
+    };
+    value: u32 = 0,
+    name: []const u8 = "",
+    flag: bool = false,
+};
+
+const EnumMsg = struct {
+    pub const tags = .{
+        .{ "kind", 1 },
+        .{ "count", 2 },
+    };
+    kind: TestEnum,
+    count: i32,
+};
+
+const NestedMsg = struct {
+    pub const tags = .{
+        .{ "inner", 1 },
+    };
+    inner: SimpleMsg,
+};
+
+const ListMsg = struct {
+    pub const tags = .{
+        .{ "items", 1 },
+    };
+    items: std.ArrayListUnmanaged(SimpleMsg),
+};
+
+const ArrayMsg = struct {
+    pub const tags = .{
+        .{ "values", 1 },
+    };
+    values: [3]u32,
+};
+
+test "encode/decode roundtrip: simple message" {
+    const allocator = std.testing.allocator;
+    const original = SimpleMsg{ .value = 42, .name = "hello", .flag = true };
+
+    var buf: [256]u8 = undefined;
+    const encoded = try encodeToSlice(original, &buf);
+
+    var fbs = std.io.fixedBufferStream(encoded);
+    const decoded = try decode(SimpleMsg, allocator, fbs.reader());
+
+    try std.testing.expectEqual(@as(u32, 42), decoded.value);
+    try std.testing.expectEqualStrings("hello", decoded.name);
+    try std.testing.expectEqual(true, decoded.flag);
+
+    allocator.free(decoded.name);
+}
+
+test "encode/decode roundtrip: non-usize enum" {
+    const allocator = std.testing.allocator;
+    const original = EnumMsg{ .kind = .baz, .count = -7 };
+
+    var buf: [256]u8 = undefined;
+    const encoded = try encodeToSlice(original, &buf);
+
+    var fbs = std.io.fixedBufferStream(encoded);
+    const decoded = try decode(EnumMsg, allocator, fbs.reader());
+
+    try std.testing.expectEqual(TestEnum.baz, decoded.kind);
+    try std.testing.expectEqual(@as(i32, -7), decoded.count);
+}
+
+test "encode/decode roundtrip: nested message" {
+    const allocator = std.testing.allocator;
+    const original = NestedMsg{
+        .inner = .{ .value = 99, .name = "nested", .flag = false },
+    };
+
+    var buf: [256]u8 = undefined;
+    const encoded = try encodeToSlice(original, &buf);
+
+    var fbs = std.io.fixedBufferStream(encoded);
+    const decoded = try decode(NestedMsg, allocator, fbs.reader());
+
+    try std.testing.expectEqual(@as(u32, 99), decoded.inner.value);
+    try std.testing.expectEqualStrings("nested", decoded.inner.name);
+    try std.testing.expectEqual(false, decoded.inner.flag);
+
+    allocator.free(decoded.inner.name);
+}
+
+test "encode/decode roundtrip: ArrayList of messages" {
+    const allocator = std.testing.allocator;
+    var items = std.ArrayListUnmanaged(SimpleMsg){};
+    defer items.deinit(allocator);
+    try items.append(allocator, .{ .value = 1, .name = "a", .flag = true });
+    try items.append(allocator, .{ .value = 2, .name = "b", .flag = false });
+
+    const original = ListMsg{ .items = items };
+
+    var buf: [512]u8 = undefined;
+    const encoded = try encodeToSlice(original, &buf);
+
+    var fbs = std.io.fixedBufferStream(encoded);
+    var decoded = try decode(ListMsg, allocator, fbs.reader());
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.items.items.len);
+    try std.testing.expectEqual(@as(u32, 1), decoded.items.items[0].value);
+    try std.testing.expectEqualStrings("a", decoded.items.items[0].name);
+    try std.testing.expectEqual(true, decoded.items.items[0].flag);
+    try std.testing.expectEqual(@as(u32, 2), decoded.items.items[1].value);
+    try std.testing.expectEqualStrings("b", decoded.items.items[1].name);
+
+    for (decoded.items.items) |item| allocator.free(item.name);
+    decoded.items.deinit(allocator);
+}
+
+test "encode/decode roundtrip: fixed array" {
+    const allocator = std.testing.allocator;
+    const original = ArrayMsg{ .values = .{ 10, 20, 30 } };
+
+    var buf: [256]u8 = undefined;
+    const encoded = try encodeToSlice(original, &buf);
+
+    var fbs = std.io.fixedBufferStream(encoded);
+    const decoded = try decode(ArrayMsg, allocator, fbs.reader());
+
+    try std.testing.expectEqual([3]u32{ 10, 20, 30 }, decoded.values);
+}
+
+test "decode skips unknown fields" {
+    // Manually craft bytes: field 1 (varint) = 42, field 99 (varint) = 123, field 2 (delimited) = "hi", field 3 (varint) = 1
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+
+    // field 1, wire=varint: value=42
+    try std.leb.writeUleb128(w, joinTag(.{ .field = 1, .wire_type = .varint_or_zigzag }));
+    try std.leb.writeUleb128(w, @as(u32, 42));
+
+    // field 99, wire=varint: unknown field
+    try std.leb.writeUleb128(w, joinTag(.{ .field = 99, .wire_type = .varint_or_zigzag }));
+    try std.leb.writeUleb128(w, @as(u32, 123));
+
+    // field 2, wire=delimited: "hi"
+    try std.leb.writeUleb128(w, joinTag(.{ .field = 2, .wire_type = .delimited }));
+    try std.leb.writeUleb128(w, @as(usize, 2));
+    try w.writeAll("hi");
+
+    // field 3, wire=varint: true
+    try std.leb.writeUleb128(w, joinTag(.{ .field = 3, .wire_type = .varint_or_zigzag }));
+    try std.leb.writeUleb128(w, @as(u32, 1));
+
+    const encoded = fbs.getWritten();
+    const allocator = std.testing.allocator;
+
+    var reader = std.io.fixedBufferStream(encoded);
+    const decoded = try decode(SimpleMsg, allocator, reader.reader());
+
+    try std.testing.expectEqual(@as(u32, 42), decoded.value);
+    try std.testing.expectEqualStrings("hi", decoded.name);
+    try std.testing.expectEqual(true, decoded.flag);
+
+    allocator.free(decoded.name);
+}
+
+test "wire type helpers" {
+    try std.testing.expectEqual(WireType.varint_or_zigzag, typeToWireType(u32));
+    try std.testing.expectEqual(WireType.varint_or_zigzag, typeToWireType(bool));
+    try std.testing.expectEqual(WireType.varint_or_zigzag, typeToWireType(TestEnum));
+    try std.testing.expectEqual(WireType.delimited, typeToWireType([]const u8));
+    try std.testing.expectEqual(WireType.delimited, typeToWireType(SimpleMsg));
+
+    // splitTag/joinTag roundtrip
+    const split = SplitTag{ .field = 5, .wire_type = .delimited };
+    try std.testing.expectEqual(split, splitTag(joinTag(split)));
 }
